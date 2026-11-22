@@ -1,0 +1,392 @@
+{
+  "$schema": "https://schemas.vibex.dev/plugin/v4/plugin.schema.json",
+  "manifestVersion": 4,
+  "apiVersion": "2.0",
+  "id": "dimo.voice-input",
+  "name": "语音输入",
+  "version": "2.1.0",
+  "publisher": "dimo",
+  "description": "AI voice dictation and speech-to-text plugin with local offline GGUF models (transcribe.cpp), 16kHz FIR resampling, VAD silence filtering, OpenAI/Groq/xAI/OpenRouter/custom Whisper engines, alias-aware vocabulary, draft-context LLM cleanup, and interactive preview HUD.",
+  "readme": "README.md",
+  "interface": {
+    "icon": "assets/icon.svg"
+  },
+  "engines": {
+    "dimo": ">=0.1.3 <1.0.0",
+    "pluginSdk": "^2.0.0"
+  },
+  "content": {
+    "root": "contents",
+    "index": ".dimo-plugin/content.index.json"
+  },
+  "config": {
+    "schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "title": "启用语音输入",
+          "description": "开启会话输入框与全局快捷键的 AI 语音听写功能。"
+        },
+        "providerProtocol": {
+          "type": "string",
+          "enum": [
+            "hybrid",
+            "local-model",
+            "openai-whisper",
+            "groq-whisper",
+            "xai-stt",
+            "openrouter-stt",
+            "openai-chat-audio",
+            "custom-openai",
+            "browser-speech"
+          ],
+          "default": "hybrid",
+          "title": "识别引擎协议",
+          "description": "选择语音识别引擎：混合流式+云端（hybrid）、本地离线 GGUF 模型（local-model，免 Key 完全离线）、OpenAI Whisper、Groq 极速 Whisper、xAI Grok STT、OpenRouter Audio、多模态 Chat Audio、自定义/本地 OpenAI 兼容端点，或浏览器/系统原生听写。"
+        },
+        "localModelId": {
+          "type": "string",
+          "enum": [
+            "handy-computer/SenseVoiceSmall-gguf",
+            "handy-computer/Qwen3-ASR-0.6B-gguf",
+            "handy-computer/whisper-large-v3-turbo-gguf",
+            "handy-computer/Fun-ASR-MLT-Nano-2512-gguf",
+            "handy-computer/parakeet-unified-en-0.6b-gguf",
+            "handy-computer/nemotron-3.5-asr-streaming-0.6b-gguf",
+            "handy-computer/whisper-medium-gguf",
+            "handy-computer/whisper-small-gguf",
+            "handy-computer/whisper-base-gguf",
+            "handy-computer/whisper-tiny-gguf",
+            "handy-computer/canary-180m-flash-gguf",
+            "handy-computer/Qwen3-ASR-1.7B-gguf"
+          ],
+          "default": "handy-computer/SenseVoiceSmall-gguf",
+          "title": "本地离线模型 (GGUF)",
+          "description": "选择本机运行的离线语音识别模型（在状态栏「本地模型」面板一键下载、校验或零拷贝链接本地文件）。",
+          "x-visible-when": {
+            "providerProtocol": [
+              "local-model"
+            ]
+          }
+        },
+        "localAcceleration": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "cpu",
+            "gpu"
+          ],
+          "default": "auto",
+          "title": "本地硬件加速",
+          "description": "本地模型推理后端：自动优先 GPU（Vulkan / Metal）并在不可用时回退 CPU、仅使用 CPU 或强制 GPU。",
+          "x-visible-when": {
+            "providerProtocol": [
+              "local-model"
+            ]
+          }
+        },
+        "localUnloadTimeoutSec": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3600,
+          "default": 300,
+          "title": "空闲自动卸载模型（秒）",
+          "description": "连续空闲达到指定秒数后自动释放常驻内存/显存中的本地模型（设为 0 表示常驻不卸载）。",
+          "x-visible-when": {
+            "providerProtocol": [
+              "local-model"
+            ]
+          }
+        },
+        "hfMirrorUrl": {
+          "type": "string",
+          "default": "https://huggingface.co",
+          "title": "模型下载镜像源",
+          "description": "GGUF 模型下载基址（默认 https://huggingface.co，国内网络可设为 https://hf-mirror.com）。",
+          "x-visible-when": {
+            "providerProtocol": [
+              "local-model"
+            ]
+          }
+        },
+        "localModelsDir": {
+          "type": "string",
+          "default": "",
+          "title": "自定义模型存储目录",
+          "description": "留空默认保存在 ~/.dimo/voice-input/models；填写自定义路径可将下载与链接的模型存放在指定磁盘。",
+          "x-visible-when": {
+            "providerProtocol": [
+              "local-model"
+            ]
+          }
+        },
+        "baseUrl": {
+          "type": "string",
+          "default": "https://api.openai.com/v1",
+          "title": "API 基础地址",
+          "description": "OpenAI / Groq / xAI / OpenRouter / 本地 Whisper（如 localhost）兼容接口基础 URL。",
+          "x-visible-when": {
+            "providerProtocol": [
+              "hybrid",
+              "openai-whisper",
+              "groq-whisper",
+              "xai-stt",
+              "openrouter-stt",
+              "openai-chat-audio",
+              "custom-openai"
+            ]
+          }
+        },
+        "apiKey": {
+          "type": "string",
+          "default": "",
+          "title": "API 密钥",
+          "description": "用于调用云端转写与 AI 润色的 API Key（本地 localhost 自定义端点可留空；留空时亦会尝试读取本机环境变量）。",
+          "x-visible-when": {
+            "providerProtocol": [
+              "hybrid",
+              "openai-whisper",
+              "groq-whisper",
+              "xai-stt",
+              "openrouter-stt",
+              "openai-chat-audio",
+              "custom-openai"
+            ]
+          }
+        },
+        "model": {
+          "type": "string",
+          "default": "gpt-4o-mini-transcribe",
+          "title": "语音识别模型",
+          "description": "转写模型名称（如 gpt-4o-mini-transcribe、whisper-large-v3-turbo、grok-voice-transcribe-2.0、openai/gpt-4o-mini-transcribe）。",
+          "x-visible-when": {
+            "providerProtocol": [
+              "hybrid",
+              "openai-whisper",
+              "groq-whisper",
+              "xai-stt",
+              "openrouter-stt",
+              "openai-chat-audio",
+              "custom-openai"
+            ]
+          }
+        },
+        "cleanupModel": {
+          "type": "string",
+          "default": "gpt-4o-mini",
+          "title": "润色模型",
+          "description": "用于听写后去口水词、结合草稿上下文修正术语的轻量级 LLM 模型。",
+          "x-visible-when": {
+            "providerProtocol": [
+              "hybrid",
+              "openai-whisper",
+              "groq-whisper",
+              "xai-stt",
+              "openrouter-stt",
+              "openai-chat-audio",
+              "custom-openai"
+            ]
+          }
+        },
+        "language": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "zh",
+            "en",
+            "ja",
+            "ko",
+            "de",
+            "fr",
+            "es"
+          ],
+          "default": "auto",
+          "title": "识别语言",
+          "description": "语音听写首选语言提示（支持自动检测及中/英/日/韩/德/法/西语）。"
+        },
+        "translateToEnglish": {
+          "type": "boolean",
+          "default": false,
+          "title": "翻译输出为英文",
+          "description": "将听写语音直接翻译并输出为英文文本（适用于支持翻译的本地 Whisper/Canary 或云端引擎）。",
+          "x-visible-when": {
+            "providerProtocol": [
+              "hybrid",
+              "local-model",
+              "openai-whisper",
+              "groq-whisper",
+              "openai-chat-audio",
+              "custom-openai"
+            ]
+          }
+        },
+        "recordingMode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "toggle",
+            "push-to-talk"
+          ],
+          "default": "auto",
+          "title": "录音触发方式",
+          "description": "智能混合（轻按切换、长按 ≥300ms 说话松开即转写）、单击切换开始/结束，或纯按住说话模式。"
+        },
+        "shortcut": {
+          "type": "string",
+          "default": "Alt+V",
+          "title": "语音输入快捷键",
+          "description": "快速开始/停止语音听写的全局快捷键（例如 Alt+V、Ctrl+Shift+V）。"
+        },
+        "cleanupMode": {
+          "type": "string",
+          "enum": [
+            "auto-clean",
+            "preview",
+            "off"
+          ],
+          "default": "auto-clean",
+          "title": "听写后润色模式",
+          "description": "自动润色后直接插入（auto-clean）、录音后弹出可编辑对照预览卡片（preview），或仅输出原始识别结果（off）。"
+        },
+        "removeFillerWords": {
+          "type": "boolean",
+          "default": true,
+          "title": "去除口水词与结巴",
+          "description": "自动过滤中英文语气词（嗯、呃、um、uh 等）与重复结巴词，并安全保留带连字符词（如 uh-huh）。"
+        },
+        "useLlmCleanup": {
+          "type": "boolean",
+          "default": true,
+          "title": "启用 LLM 上下文润色",
+          "description": "结合当前输入框上下文进行智能标点与纠错（润色期间可随时一键跳过）。",
+          "x-visible-when": {
+            "providerProtocol": [
+              "hybrid",
+              "openai-whisper",
+              "groq-whisper",
+              "xai-stt",
+              "openrouter-stt",
+              "openai-chat-audio",
+              "custom-openai"
+            ]
+          }
+        },
+        "correctionCue": {
+          "type": "string",
+          "default": "",
+          "title": "口头自纠正触发词",
+          "description": "设置口头改口词（如「不对」或「scratch that」）：该词会被保护不被当作口水词过滤，并指示润色模型采纳改口后的表述。"
+        },
+        "cleanupInstructions": {
+          "type": "string",
+          "default": "",
+          "title": "自定义润色指令",
+          "description": "附加给润色模型的自定义格式或风格偏好（例如：保留英文代码变量、使用简洁书面语）。",
+          "x-visible-when": {
+            "providerProtocol": [
+              "hybrid",
+              "openai-whisper",
+              "groq-whisper",
+              "xai-stt",
+              "openrouter-stt",
+              "openai-chat-audio",
+              "custom-openai"
+            ]
+          }
+        },
+        "vocabulary": {
+          "type": "string",
+          "format": "token-list",
+          "default": "Dimo, Tauri, Monaco, TypeScript, Rust, React, MCP, Skill, Worktree, Claude, Codex",
+          "title": "自定义术语热词表",
+          "description": "支持普通热词与别名映射（如 Dimo = vibe x | vibex），自动用于识别提示词、别名替换与音近模糊纠错。"
+        },
+        "silenceFiltering": {
+          "type": "boolean",
+          "default": true,
+          "title": "静音检测与裁剪 (VAD)",
+          "description": "上传前自动裁剪首尾静音与长停顿，并拦截空白静音录音以减少延迟和幻觉。"
+        },
+        "audioDeviceId": {
+          "type": "string",
+          "default": "default",
+          "title": "麦克风输入设备",
+          "description": "指定录音使用的麦克风设备 ID（default 为系统默认并按设备优先级自动回退；可在状态栏语音面板中下拉选择并试音）。"
+        },
+        "showFloatingHud": {
+          "type": "boolean",
+          "default": true,
+          "title": "显示实时字幕悬浮胶囊",
+          "description": "在录音、润色、预览或报错时展示可拖拽的毛玻璃声波胶囊与交互预览卡片。"
+        }
+      }
+    }
+  },
+  "entrypoints": {
+    "worker": {
+      "path": "dist/worker.mjs",
+      "runtime": "node",
+      "protocol": "1.1"
+    },
+    "app": {
+      "entry": "app/main.js",
+      "protocol": "2.0"
+    }
+  },
+  "integrations": [
+    {
+      "id": "voice-input-status",
+      "kind": "app.status",
+      "slot": "status.after-mcp",
+      "title": "语音输入",
+      "handler": "voice.status",
+      "icon": "activity",
+      "order": 35
+    },
+    {
+      "id": "voice-input-toggle",
+      "kind": "app.command",
+      "title": "开始/停止 AI 语音输入",
+      "handler": "voice.toggle",
+      "icon": "activity",
+      "order": 36
+    },
+    {
+      "id": "voice-input-transcribe",
+      "kind": "app.command",
+      "title": "执行语音转写与智能润色",
+      "handler": "voice.transcribe",
+      "icon": "sparkles",
+      "order": 37
+    },
+    {
+      "id": "voice-input-cleanup",
+      "kind": "app.command",
+      "title": "润色语音听写文本",
+      "handler": "voice.cleanup",
+      "icon": "sparkles",
+      "order": 38
+    },
+    {
+      "id": "voice-input-configure",
+      "kind": "app.command",
+      "title": "配置 AI 语音输入",
+      "handler": "voice.configure",
+      "icon": "settings",
+      "order": 39
+    },
+    {
+      "id": "voice-input-skill",
+      "kind": "content.skill",
+      "resource": "contents/skills/voice-input",
+      "targets": [
+        "codex",
+        "claude-code",
+        "acp"
+      ]
+    }
+  ]
+}

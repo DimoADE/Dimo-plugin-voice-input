@@ -1,0 +1,95 @@
+{
+  "lockVersion": 1,
+  "packageDigest": "16e508b87efe018816ee668c84691d65fb31df3f1947967e70a905f3dcafc55d",
+  "files": [
+    {
+      "path": ".dimo-plugin/content.index.json",
+      "size": 454,
+      "sha256": "e7ec0b4111f9216702bd37bfd7bc309e60f588fdddc35e1138c28cebd21ca6f5"
+    },
+    {
+      "path": ".dimo-plugin/plugin.json",
+      "size": 13704,
+      "sha256": "07b24192205f4f2daba5fa99fe3aa8ff47af5dd8b1bdbb0efe2d9bebb891539b"
+    },
+    {
+      "path": "README.md",
+      "size": 2257,
+      "sha256": "cae76cd36143d877bea1760c549990c0afa2ad8147c3f3eae36a2836dfad0651"
+    },
+    {
+      "path": "app/main.d.ts",
+      "size": 123,
+      "sha256": "8a0a576e9f7ea135b57c95e156b66eb3af5f613fb09216c7e4a66a53cd5325ec"
+    },
+    {
+      "path": "app/main.js",
+      "size": 127238,
+      "sha256": "28bd0a4aa20fe1d3a5cb6337bca6f73066505c1338c1f80aaef8d12f7b20c092"
+    },
+    {
+      "path": "assets/icon.svg",
+      "size": 1404,
+      "sha256": "2335c6985f407d04797301d53f8980b34a6af4ae3a87dbfd3c64b0189803852d"
+    },
+    {
+      "path": "contents/skills/voice-input/SKILL.md",
+      "size": 2654,
+      "sha256": "bae01024896df75f8ac1210fff9b944688ab9ecfd115f72c8f437bfc6c3728a5"
+    },
+    {
+      "path": "dist/worker.mjs",
+      "size": 102831,
+      "sha256": "0094c21f3726c3fb752bcae7a00db3967d40c27673b42f8f4062ef8144045615"
+    },
+    {
+      "path": "worker/audio.mjs",
+      "size": 8703,
+      "sha256": "5fb72ca9c541730435089b6103713422bdd22f909b102ac2c2854aabfcd83d86"
+    },
+    {
+      "path": "worker/config.mjs",
+      "size": 6549,
+      "sha256": "bb4dace1f800dd2db90774f3537b755c6b8c98454b27adb41ae23bfdbaa5f5c1"
+    },
+    {
+      "path": "worker/index.mjs",
+      "size": 33612,
+      "sha256": "3fc08677b0f7a5cf76eae863d09971867c06c3b0534e0ad01e3e07363b32addc"
+    },
+    {
+      "path": "worker/localCatalog.mjs",
+      "size": 9689,
+      "sha256": "b9d16df51cc226636319ea6c49658f629bd500fe2f11691799a8d3e8ffb22e9b"
+    },
+    {
+      "path": "worker/localModelStore.mjs",
+      "size": 24990,
+      "sha256": "6505307d7518ddd8e6a628422d19259f18ecaf9a33a35843c2c853d84921bf30"
+    },
+    {
+      "path": "worker/localRuntime.mjs",
+      "size": 24693,
+      "sha256": "a2b87e44cb6429fd5d6b9b214402d5b9767a0d516450ccfdf325310a9723786a"
+    },
+    {
+      "path": "worker/nativeSpeech.mjs",
+      "size": 3120,
+      "sha256": "9b729a6d7d878a1b8514bb307eae25cb3495fae71e787b4898456fd3477e359b"
+    },
+    {
+      "path": "worker/providers.mjs",
+      "size": 11249,
+      "sha256": "86e54633c10f7752b2b823349ee93d6ba909964c44a7decaf17645fd95b32339"
+    },
+    {
+      "path": "worker/textProcessing.mjs",
+      "size": 17045,
+      "sha256": "af59e8188ac6d9d0835056238383da6d26f81fdad571a59e71b2c35e3d64353e"
+    }
+  ],
+  "build": {
+    "cliVersion": "1.0.0",
+    "reproducible": true
+  }
+}

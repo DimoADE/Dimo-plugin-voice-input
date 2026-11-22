@@ -1,997 +1,884 @@
-import { execFile } from 'node:child_process';
-import { unlink, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 
-function definePluginWorker(setup) {
-  return {
-    apiVersion: '2.0',
-    setup,
-  };
-}
+import {
+  detectSilenceAndTrimPcm,
+  encodePcm16WavBuffer,
+  filterSilenceFromWavBase64,
+  parseWavBuffer,
+  stripBase64DataUrlPrefix,
+} from './audio.mjs';
+import {
+  DEFAULT_VOICE_CONFIG,
+  PLUGIN_ID,
+  isLocalhostUrl,
+  normalizeVoiceConfig,
+  resolveApiKey,
+} from './config.mjs';
+import {
+  CN_HF_MIRROR_URL,
+  DEFAULT_HF_MIRROR_URL,
+  DEFAULT_LOCAL_MODEL_ID,
+  LOCAL_SPEECH_MODELS,
+  buildModelDownloadUrl,
+  formatBytes,
+  getLocalSpeechModel,
+} from './localCatalog.mjs';
+import { LocalModelStore } from './localModelStore.mjs';
+import { LocalSpeechRuntime, TRANSCRIBE_CPP_VERSION } from './localRuntime.mjs';
+import { transcribeWavWithWindowsSpeech } from './nativeSpeech.mjs';
+import {
+  buildChatAudioRequest,
+  buildMultipartAudioRequest,
+  buildOpenRouterAudioRequest,
+  buildXaiSttRequest,
+  classifyCloudError,
+  extractTranscriptionText,
+} from './providers.mjs';
+import {
+  buildCleanupChatRequest,
+  buildWhisperPrompt,
+  cleanTranscriptText,
+  levenshteinDistance,
+  normalizeVocabularyTerms,
+  parseVocabularyEntries,
+  parseVocabularyList,
+  soundex,
+  stripSpokenFillers,
+} from './textProcessing.mjs';
 
-export const DEFAULT_VOICE_CONFIG = Object.freeze({
-  enabled: true,
-  providerProtocol: 'hybrid',
-  baseUrl: 'https://api.openai.com/v1',
-  apiKey: '',
-  model: 'gpt-4o-mini-transcribe',
-  cleanupModel: 'gpt-4o-mini',
-  language: 'auto',
-  recordingMode: 'toggle',
-  shortcut: 'Alt+V',
-  cleanupMode: 'auto-clean',
-  vocabulary:
-    'VibeX, Tauri, Monaco, TypeScript, Rust, React, MCP, Skill, Worktree, Claude, Codex',
-  audioDeviceId: 'default',
-  showFloatingHud: true,
-});
+export {
+  CN_HF_MIRROR_URL,
+  DEFAULT_HF_MIRROR_URL,
+  DEFAULT_LOCAL_MODEL_ID,
+  DEFAULT_VOICE_CONFIG,
+  LOCAL_SPEECH_MODELS,
+  LocalModelStore,
+  LocalSpeechRuntime,
+  PLUGIN_ID,
+  TRANSCRIBE_CPP_VERSION,
+  buildChatAudioRequest,
+  buildCleanupChatRequest,
+  buildModelDownloadUrl,
+  buildMultipartAudioRequest,
+  buildOpenRouterAudioRequest,
+  buildWhisperPrompt,
+  buildXaiSttRequest,
+  classifyCloudError,
+  cleanTranscriptText,
+  detectSilenceAndTrimPcm,
+  encodePcm16WavBuffer,
+  extractTranscriptionText,
+  filterSilenceFromWavBase64,
+  formatBytes,
+  getLocalSpeechModel,
+  isLocalhostUrl,
+  levenshteinDistance,
+  normalizeVocabularyTerms,
+  normalizeVoiceConfig,
+  parseVocabularyEntries,
+  parseVocabularyList,
+  parseWavBuffer,
+  resolveApiKey,
+  soundex,
+  stripBase64DataUrlPrefix,
+  stripSpokenFillers,
+  transcribeWavWithWindowsSpeech,
+};
 
-const LANGUAGE_BCP47_MAP = Object.freeze({
-  auto: 'zh-CN',
-  zh: 'zh-CN',
-  en: 'en-US',
-  ja: 'ja-JP',
-  ko: 'ko-KR',
-});
-
-export function resolveBcp47Language(lang = 'auto') {
-  const key = String(lang || 'auto').trim().toLowerCase();
-  return LANGUAGE_BCP47_MAP[key] || 'zh-CN';
-}
-
-export function parseVocabularyList(rawVocabulary) {
-  if (Array.isArray(rawVocabulary)) {
-    return rawVocabulary
-      .map((item) => String(item ?? '').trim())
-      .filter(Boolean);
-  }
-  if (typeof rawVocabulary !== 'string' || !rawVocabulary.trim()) {
-    return [];
-  }
-  return rawVocabulary
-    .split(/[,，;\n\r]+/)
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
-export function buildWhisperPrompt(vocabulary, language = 'auto') {
-  const terms = parseVocabularyList(vocabulary);
-  const langKey = String(language || 'auto').trim().toLowerCase();
-  if (terms.length === 0) {
-    return langKey === 'en'
-      ? 'Software engineering dictation with technical terminology.'
-      : '软件研发与 AI 编程语音听写，请使用准确的标点符号与技术术语。';
-  }
-  const joined = terms.join(', ');
-  if (langKey === 'en') {
-    return `Technical glossary and preferred spellings: ${joined}.`;
-  }
-  return `技术术语与专有名词词表：${joined}。请保持专有名词大小写准确并添加规范标点。`;
-}
-
-const PHONETIC_TERM_ALIASES = Object.freeze({
-  VibeX: [/\bvibe\s*[-_]?\s*x\b/gi, /\bvibex\b/gi],
-  Tauri: [/\btauri\b/gi, /淘瑞/g],
-  Monaco: [/\bmonaco\b/gi],
-  TypeScript: [/\btype\s*script\b/gi, /\btypescript\b/gi],
-  JavaScript: [/\bjava\s*script\b/gi, /\bjavascript\b/gi],
-  Worktree: [/\bwork\s*tree\b/gi, /\bworktree\b/gi],
-  Claude: [/\bclaude\b/gi],
-  Codex: [/\bcodex\b/gi],
-  React: [/\breact\b/gi],
-  Rust: [/\brust\b/gi],
-  MCP: [/\bmcp\b/gi, /\bm\.c\.p\.?\b/gi],
-});
-
-function escapeRegExp(str) {
-  return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-export function normalizeVocabularyTerms(text, vocabulary) {
-  if (typeof text !== 'string' || !text) return '';
-  let output = text;
-  const terms = parseVocabularyList(vocabulary);
-
-  for (const term of terms) {
-    const aliases = PHONETIC_TERM_ALIASES[term];
-    if (Array.isArray(aliases)) {
-      for (const regex of aliases) {
-        output = output.replace(regex, term);
-      }
-    }
-    if (/^[A-Za-z][A-Za-z0-9._-]*$/.test(term)) {
-      const spacedPattern = term
-        .replace(/([a-z])([A-Z])/g, '$1\\s*$2')
-        .split('')
-        .map((ch) => (ch === '\\' || ch === 's' || ch === '*' ? ch : escapeRegExp(ch)))
-        .join('');
-      try {
-        const rx = new RegExp(`\\b${spacedPattern}\\b`, 'gi');
-        output = output.replace(rx, term);
-      } catch {
-        // Fallback to exact case-insensitive word match
-        const fallbackRx = new RegExp(`\\b${escapeRegExp(term)}\\b`, 'gi');
-        output = output.replace(fallbackRx, term);
-      }
-    }
-  }
-  return output;
-}
-
-/**
- * Deterministic post-transcription cleanup:
- * - Removes spoken Chinese & English filler words ("嗯", "啊", "呃", "那个", "就是说", "um", "uh", "er")
- * - Collapses immediate stuttered word repetitions ("我我想要" -> "我想要", "the the" -> "the")
- * - Normalizes CJK / Latin spacing and punctuation
- * - Applies custom vocabulary canonical casing
- */
-export function cleanTranscriptText(rawText, options = {}) {
-  if (typeof rawText !== 'string') return '';
-  let text = rawText.trim();
-  if (!text) return '';
-
-  const cleanupMode = options.cleanupMode || 'auto-clean';
-  const vocabulary = options.vocabulary ?? DEFAULT_VOICE_CONFIG.vocabulary;
-
-  if (cleanupMode === 'off') {
-    return normalizeVocabularyTerms(text.replace(/\s+/g, ' ').trim(), vocabulary);
-  }
-
-  // 1. Strip leading/standalone spoken fillers in Chinese
-  text = text.replace(
-    /^(?:[嗯啊呃哦唉]+[，,、。\s]*)+/g,
-    '',
-  );
-  text = text.replace(
-    /(?:(?<=^)|(?<=[，,。！？；：、\s]))(?:嗯+|啊+|呃+|那个就是说|就是说呢|怎么说呢|然后呢就是)[，,、\s]*/g,
-    '',
-  );
-  // Strip trailing modal filler particles when followed by punctuation
-  text = text.replace(/\s*[嗯呃]+[，,、]+/g, '，');
-
-  // 2. Strip English spoken fillers ("um", "uh", "er", "erm")
-  text = text.replace(
-    /\b(?:um+|uh+|er+|erm+|ah+)\b[,\s]*/gi,
-    '',
-  );
-
-  // 3. Collapse immediate repeated words/characters from stuttering
-  text = text.replace(/\b([A-Za-z]+)\s+\1\b/gi, '$1');
-  text = text.replace(/([我你他她它这那])(?:\s*[，,、]?\s*\1)+/g, '$1');
-
-  // 4. Normalize vocabulary / hotwords
-  text = normalizeVocabularyTerms(text, vocabulary);
-
-  // 5. Add clean spacing between CJK characters and ASCII words/numbers
-  text = text.replace(/([\u4e00-\u9fa5])([A-Za-z0-9])/g, '$1 $2');
-  text = text.replace(/([A-Za-z0-9])([\u4e00-\u9fa5])/g, '$1 $2');
-
-  // 6. Collapse redundant whitespace and duplicate punctuation
-  text = text.replace(/[ \t]{2,}/g, ' ');
-  text = text.replace(/[，,]{2,}/g, '，');
-  text = text.replace(/[。.]{2,}/g, (match) => (match.includes('...') ? '...' : '。'));
-  text = text.replace(/^[，,、；;：:\s]+/, '').trim();
-
-  // 7. Ensure terminal punctuation for complete sentences in Chinese if missing
-  if (
-    text.length >= 6 &&
-    /[\u4e00-\u9fa5]$/.test(text) &&
-    !/[。！？.!?:：；;，,]$/.test(text)
-  ) {
-    if (/^(?:请问|能不能|可以|如何|怎么|为什么|是不是|有没有)/.test(text) || /[吗呢]$/.test(text)) {
-      text = `${text}？`;
-    }
-  }
-
-  return text.trim();
-}
-
-export function decodeAudioPayload(audioBase64) {
-  if (!audioBase64 || typeof audioBase64 !== 'string') {
-    return new Uint8Array(0);
-  }
-  const cleaned = audioBase64.includes(',')
-    ? audioBase64.slice(audioBase64.indexOf(',') + 1).trim()
-    : audioBase64.trim();
-  if (!cleaned) return new Uint8Array(0);
-  return new Uint8Array(Buffer.from(cleaned, 'base64'));
-}
-
-export function resolveTranscriptionEndpoint(baseUrl, providerProtocol = 'openai-whisper') {
-  const trimmed = String(baseUrl || DEFAULT_VOICE_CONFIG.baseUrl)
-    .trim()
-    .replace(/\/+$/, '');
-  if (
-    providerProtocol === 'groq-whisper' &&
-    trimmed === 'https://api.openai.com/v1'
-  ) {
-    return 'https://api.groq.com/openai/v1/audio/transcriptions';
-  }
-  if (trimmed.endsWith('/audio/transcriptions')) {
-    return trimmed;
-  }
-  if (trimmed.endsWith('/v1')) {
-    return `${trimmed}/audio/transcriptions`;
-  }
-  return `${trimmed}/v1/audio/transcriptions`;
-}
-
-export function resolveChatCompletionsEndpoint(baseUrl) {
-  const trimmed = String(baseUrl || DEFAULT_VOICE_CONFIG.baseUrl)
-    .trim()
-    .replace(/\/+$/, '');
-  if (trimmed.endsWith('/chat/completions')) {
-    return trimmed;
-  }
-  if (trimmed.endsWith('/v1')) {
-    return `${trimmed}/chat/completions`;
-  }
-  return `${trimmed}/v1/chat/completions`;
-}
-
-export function buildMultipartAudioRequest({
-  baseUrl,
-  apiKey,
-  providerProtocol = 'openai-whisper',
-  model = 'gpt-4o-mini-transcribe',
-  audioBase64 = '',
-  mimeType = 'audio/webm',
-  language = 'auto',
-  vocabulary = '',
-}) {
-  const url = resolveTranscriptionEndpoint(baseUrl, providerProtocol);
-  const effectiveModel =
-    providerProtocol === 'groq-whisper' &&
-    (!model || model === 'gpt-4o-mini-transcribe')
-      ? 'whisper-large-v3-turbo'
-      : model || 'whisper-1';
-
-  const boundary = `----VibeXVoiceBoundary${Date.now().toString(16)}`;
-  const audioBytes = decodeAudioPayload(audioBase64);
-  const ext = mimeType.includes('wav')
-    ? 'wav'
-    : mimeType.includes('mp4') || mimeType.includes('m4a')
-      ? 'm4a'
-      : mimeType.includes('ogg')
-        ? 'ogg'
-        : 'webm';
-  const prompt = buildWhisperPrompt(vocabulary, language);
-  const langIso =
-    language && language !== 'auto'
-      ? String(language).split('-')[0].toLowerCase()
-      : '';
-
-  const textParts = [];
-  const pushField = (name, value) => {
-    if (value === undefined || value === null || value === '') return;
-    textParts.push(
-      Buffer.from(
-        `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${String(value)}\r\n`,
-        'utf8',
-      ),
-    );
-  };
-
-  pushField('model', effectiveModel);
-  pushField('response_format', 'json');
-  if (langIso) {
-    pushField('language', langIso);
-  }
-  if (prompt) {
-    pushField('prompt', prompt);
-  }
-
-  const fileHeader = Buffer.from(
-    `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="speech.${ext}"\r\nContent-Type: ${mimeType || 'audio/webm'}\r\n\r\n`,
-    'utf8',
-  );
-  const fileFooter = Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8');
-  const bodyBuffer = Buffer.concat([
-    ...textParts,
-    fileHeader,
-    Buffer.from(audioBytes),
-    fileFooter,
-  ]);
-
-  const headers = {
-    'Content-Type': `multipart/form-data; boundary=${boundary}`,
-  };
-  if (apiKey) {
-    headers.Authorization = `Bearer ${apiKey}`;
-  }
-
-  return {
-    url,
-    method: 'POST',
-    headers,
-    body: bodyBuffer,
-    model: effectiveModel,
-    prompt,
-    language: langIso || 'auto',
-  };
-}
-
-export function buildChatAudioRequest({
-  baseUrl,
-  apiKey,
-  model = 'gpt-4o-audio-preview',
-  audioBase64 = '',
-  mimeType = 'audio/wav',
-  language = 'auto',
-  vocabulary = '',
-  cleanupMode = 'auto-clean',
-}) {
-  const url = resolveChatCompletionsEndpoint(baseUrl);
-  const cleanedBase64 = audioBase64.includes(',')
-    ? audioBase64.slice(audioBase64.indexOf(',') + 1).trim()
-    : String(audioBase64 || '').trim();
-  const format = mimeType.includes('mp3') ? 'mp3' : 'wav';
-  const prompt = buildWhisperPrompt(vocabulary, language);
-  const instruction =
-    cleanupMode === 'off'
-      ? `Transcribe the user's speech verbatim. ${prompt} Output only the transcript text.`
-      : `Transcribe the user's speech accurately, removing spoken filler words (such as um, uh, 嗯, 啊, 那个) and fixing technical terminology spelling. ${prompt} Output only the final transcript text without quotes or explanations.`;
-
-  const headers = {
-    'Content-Type': 'application/json',
-  };
-  if (apiKey) {
-    headers.Authorization = `Bearer ${apiKey}`;
-  }
-
-  const payload = {
-    model: model || 'gpt-4o-audio-preview',
-    temperature: 0,
-    messages: [
-      {
-        role: 'user',
-        content: [
-          { type: 'text', text: instruction },
-          {
-            type: 'input_audio',
-            input_audio: {
-              data: cleanedBase64,
-              format,
-            },
-          },
-        ],
-      },
-    ],
-  };
-
-  return {
-    url,
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload),
-    model: payload.model,
-  };
-}
-
-export function buildCleanupChatRequest({
-  baseUrl,
-  apiKey,
-  model = 'gpt-4o-mini',
-  rawText = '',
-  language = 'auto',
-  vocabulary = '',
-}) {
-  const url = resolveChatCompletionsEndpoint(baseUrl);
-  const terms = parseVocabularyList(vocabulary);
-  const glossaryNote =
-    terms.length > 0
-      ? `Preferred technical glossary: ${terms.join(', ')}.`
-      : '';
-  const systemPrompt = [
-    'You are an intelligent voice dictation post-processor for a software engineering IDE (VibeX).',
-    'Clean up the raw speech-to-text transcript:',
-    '1. Remove spoken filler words, hesitations, and stutters (e.g. 嗯, 啊, 呃, 那个, 就是说, um, uh, you know).',
-    '2. Preserve the speaker’s exact intent, language, and tone — do NOT answer questions or expand the prompt.',
-    '3. Correct technical terms and product names using the glossary.',
-    glossaryNote,
-    'Output ONLY the cleaned transcript text without any quotes, markdown wrappers, or commentary.',
-  ]
-    .filter(Boolean)
-    .join('\n');
-
-  const headers = {
-    'Content-Type': 'application/json',
-  };
-  if (apiKey) {
-    headers.Authorization = `Bearer ${apiKey}`;
-  }
-
-  const payload = {
-    model: model || 'gpt-4o-mini',
-    temperature: 0.1,
-    max_tokens: 1024,
-    messages: [
-      { role: 'system', content: systemPrompt },
-      {
-        role: 'user',
-        content: `Language hint: ${language || 'auto'}\nRaw transcript:\n${rawText}`,
-      },
-    ],
-  };
-
-  return {
-    url,
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload),
-    model: payload.model,
-  };
-}
-
-export async function transcribeWithNativeOsSpeech(
-  wavBase64,
-  language = 'auto',
-  signal = undefined,
-) {
-  const bytes = decodeAudioPayload(wavBase64);
-  if (bytes.length < 44) return '';
-  if (typeof process === 'undefined' || process.platform !== 'win32') {
-    return '';
-  }
-
-  const tempWavPath = join(
-    tmpdir(),
-    `vibex-voice-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.wav`,
-  );
-  try {
-    await writeFile(tempWavPath, bytes);
-    const bcp47 = resolveBcp47Language(language);
-    const psScript = `
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Speech
-$wavPath = $env:VIBEX_VOICE_WAV_PATH
-$cultureName = $env:VIBEX_VOICE_CULTURE
-$recognizers = [System.Speech.Recognition.SpeechRecognitionEngine]::InstalledRecognizers()
-if (-not $recognizers -or $recognizers.Count -eq 0) { exit 0 }
-$selected = $recognizers | Where-Object { $_.Culture.Name -eq $cultureName } | Select-Object -First 1
-if (-not $selected) {
-  $langPrefix = ($cultureName -split '-')[0]
-  $selected = $recognizers | Where-Object { $_.Culture.TwoLetterISOLanguageName -eq $langPrefix } | Select-Object -First 1
-}
-if (-not $selected) { $selected = $recognizers | Select-Object -First 1 }
-$engine = New-Object System.Speech.Recognition.SpeechRecognitionEngine($selected.Id)
-$engine.LoadGrammar((New-Object System.Speech.Recognition.DictationGrammar))
-$engine.SetInputToWaveFile($wavPath)
-$segments = New-Object System.Collections.Generic.List[string]
-for ($i = 0; $i -lt 30; $i++) {
-  try {
-    $res = $engine.Recognize()
-    if ($null -eq $res) { break }
-    if (-not [string]::IsNullOrWhiteSpace($res.Text)) {
-      $segments.Add($res.Text.Trim())
-    }
-  } catch {
-    break
-  }
-}
-$engine.Dispose()
-Write-Output ($segments -join ' ')
-`;
-    const encodedCommand = Buffer.from(psScript, 'utf16le').toString('base64');
-    const output = await new Promise((resolve) => {
-      execFile(
-        'powershell.exe',
-        [
-          '-NoProfile',
-          '-NonInteractive',
-          '-ExecutionPolicy',
-          'Bypass',
-          '-EncodedCommand',
-          encodedCommand,
-        ],
-        {
-          encoding: 'utf8',
-          timeout: 12000,
-          windowsHide: true,
-          signal,
-          env: {
-            ...process.env,
-            VIBEX_VOICE_WAV_PATH: tempWavPath,
-            VIBEX_VOICE_CULTURE: bcp47,
-          },
-        },
-        (err, stdout) => {
-          if (err) {
-            resolve('');
-            return;
-          }
-          resolve(String(stdout || '').trim());
-        },
-      );
-    });
-    return output;
-  } catch {
-    return '';
-  } finally {
-    await unlink(tempWavPath).catch(() => {});
-  }
+function makeVoiceError(code, message, action = 'retry', retryable = true) {
+  const err = new Error(message);
+  err.code = code;
+  err.errorCode = code;
+  err.action = action;
+  err.errorAction = action;
+  err.retryable = retryable;
+  return err;
 }
 
 export class VoiceInputEngine {
   constructor(options = {}) {
-    this.config = {
-      ...DEFAULT_VOICE_CONFIG,
-      ...(options.config && typeof options.config === 'object' ? options.config : {}),
-    };
+    this.config = normalizeVoiceConfig(options.config || {});
     this.fetchImpl = options.fetchImpl || globalThis.fetch;
+    this.env = options.env || process.env;
     this.nativeOsTranscribeImpl =
-      options.nativeOsTranscribeImpl || transcribeWithNativeOsSpeech;
-    this.activeControllers = new Map();
+      options.nativeOsTranscribeImpl || transcribeWavWithWindowsSpeech;
+    this.modelStore =
+      options.modelStore ||
+      new LocalModelStore({
+        modelsDir: this.config.localModelsDir || undefined,
+        fetchImpl: this.fetchImpl,
+        env: this.env,
+      });
+    this.localRuntime =
+      options.localRuntime ||
+      new LocalSpeechRuntime({
+        env: this.env,
+      });
     this.history = [];
+    this.activeAbortControllers = new Map();
     this.metrics = {
       totalTranscriptions: 0,
-      completedTranscriptions: 0,
-      cleanedTranscriptions: 0,
-      cancelledTranscriptions: 0,
-      errors: 0,
+      cloudTranscriptions: 0,
+      localModelTranscriptions: 0,
+      browserFallbackTranscriptions: 0,
+      osSpeechTranscriptions: 0,
+      llmCleanups: 0,
+      silenceFilteredCount: 0,
+      lastLatencyMs: 0,
+      lastProvider: null,
       lastError: null,
-      lastLatencyMs: null,
-      lastProviderUsed: null,
+      lastErrorCode: null,
     };
   }
 
-  updateConfig(partialConfig = {}) {
-    if (!partialConfig || typeof partialConfig !== 'object') {
-      return this.getConfig();
+  updateConfig(partial = {}) {
+    this.config = normalizeVoiceConfig({ ...this.config, ...(partial || {}) });
+    if (this.modelStore && typeof this.modelStore.setModelsDir === 'function') {
+      this.modelStore.setModelsDir(this.config.localModelsDir);
     }
-    this.config = {
-      ...this.config,
-      ...partialConfig,
-    };
-    return this.getConfig();
-  }
-
-  getConfig() {
-    return { ...this.config };
+    return this.config;
   }
 
   getStatus() {
-    const enabled = Boolean(this.config.enabled);
-    const protocol = this.config.providerProtocol || 'hybrid';
-    const shortcut = this.config.shortcut || 'Alt+V';
+    const apiKey = resolveApiKey(this.config, this.env);
+    const localUnauthAllowed =
+      (this.config.providerProtocol === 'custom-openai' ||
+        this.config.providerProtocol === 'openai-whisper') &&
+      isLocalhostUrl(this.config.baseUrl);
     return {
-      enabled,
-      providerProtocol: protocol,
-      baseUrl: this.config.baseUrl,
+      pluginId: PLUGIN_ID,
+      enabled: this.config.enabled,
+      providerProtocol: this.config.providerProtocol,
+      localModelId: this.config.localModelId,
+      localAcceleration: this.config.localAcceleration,
+      localUnloadTimeoutSec: this.config.localUnloadTimeoutSec,
+      hfMirrorUrl: this.config.hfMirrorUrl,
+      localModelsDir: this.config.localModelsDir,
+      modelsDir: this.modelStore?.modelsDir || '',
+      runtimeDir: this.localRuntime?.runtimeDir || '',
       model: this.config.model,
       cleanupModel: this.config.cleanupModel,
       language: this.config.language,
+      translateToEnglish: this.config.translateToEnglish,
       recordingMode: this.config.recordingMode,
-      shortcut,
+      shortcut: this.config.shortcut,
       cleanupMode: this.config.cleanupMode,
-      vocabulary: this.config.vocabulary,
-      audioDeviceId: this.config.audioDeviceId,
-      showFloatingHud: Boolean(this.config.showFloatingHud),
-      inFlightCount: this.activeControllers.size,
-      historyCount: this.history.length,
+      removeFillerWords: this.config.removeFillerWords,
+      useLlmCleanup: this.config.useLlmCleanup,
+      correctionCue: this.config.correctionCue,
+      silenceFiltering: this.config.silenceFiltering,
+      hasApiKey: Boolean(apiKey),
+      cloudReady: Boolean(apiKey) || localUnauthAllowed,
       metrics: { ...this.metrics },
-      text: enabled ? `语音输入 (${shortcut})` : '语音输入 (已禁用)',
-      tooltip: enabled
-        ? `AI 语音输入已就绪 · 协议: ${protocol} · 快捷键: ${shortcut}`
-        : 'AI 语音输入已关闭，点击启用或配置',
+      historyCount: this.history.length,
     };
   }
 
-  resolveEffectiveApiKey(overrideConfig = {}) {
-    const explicit = String(
-      overrideConfig.apiKey ?? this.config.apiKey ?? '',
-    ).trim();
-    if (explicit) return explicit;
-    if (typeof process !== 'undefined' && process.env) {
-      if (
-        (overrideConfig.providerProtocol || this.config.providerProtocol) ===
-          'groq-whisper' &&
-        process.env.GROQ_API_KEY
-      ) {
-        return String(process.env.GROQ_API_KEY).trim();
-      }
-      if (process.env.OPENAI_API_KEY) {
-        return String(process.env.OPENAI_API_KEY).trim();
-      }
-      if (process.env.VIBEX_API_KEY) {
-        return String(process.env.VIBEX_API_KEY).trim();
-      }
-    }
-    return '';
+  getHistory(limit = 20) {
+    return this.history.slice(0, Math.max(1, Math.min(50, limit)));
   }
 
-  cancelRequest(requestId = null) {
-    if (requestId && this.activeControllers.has(requestId)) {
-      const controller = this.activeControllers.get(requestId);
-      controller.abort();
-      this.activeControllers.delete(requestId);
-      this.metrics.cancelledTranscriptions += 1;
+  cancel(requestId) {
+    if (requestId && this.activeAbortControllers.has(requestId)) {
+      this.activeAbortControllers.get(requestId).abort();
+      this.activeAbortControllers.delete(requestId);
       return { cancelled: true, requestId };
     }
-    let cancelledCount = 0;
-    for (const [id, controller] of this.activeControllers.entries()) {
-      controller.abort();
-      this.activeControllers.delete(id);
-      cancelledCount += 1;
+    for (const ac of this.activeAbortControllers.values()) {
+      ac.abort();
     }
-    if (cancelledCount > 0) {
-      this.metrics.cancelledTranscriptions += cancelledCount;
-    }
-    return { cancelled: cancelledCount > 0, cancelledCount };
+    this.activeAbortControllers.clear();
+    return { cancelled: true };
   }
 
-  async cleanup(params = {}) {
-    const effectiveConfig = {
-      ...this.config,
-      ...(params.config && typeof params.config === 'object' ? params.config : {}),
-    };
-    const rawText = String(params.rawText ?? params.text ?? '').trim();
+  async _fetchJson(request, signal, providerLabel) {
+    if (typeof this.fetchImpl !== 'function') {
+      throw makeVoiceError('unavailable', '当前运行环境缺少 fetch 实现', 'retry', true);
+    }
+    let response;
+    try {
+      response = await this.fetchImpl(request.url, {
+        method: request.method || 'POST',
+        headers: request.headers,
+        body: request.body,
+        redirect: 'error',
+        signal,
+      });
+    } catch (err) {
+      if (err?.name === 'AbortError') {
+        throw makeVoiceError('cancelled', '语音转写已取消', null, false);
+      }
+      throw makeVoiceError(
+        'network-error',
+        `无法连接到 ${providerLabel} 语音服务：${String(err?.message || err)}`,
+        'retry',
+        true,
+      );
+    }
+
+    let payload = null;
+    let rawBody = '';
+    if (typeof response.json === 'function') {
+      try {
+        payload = await response.json();
+      } catch {
+        if (typeof response.text === 'function') {
+          rawBody = await response.text().catch(() => '');
+        }
+      }
+    } else if (typeof response.text === 'function') {
+      rawBody = await response.text().catch(() => '');
+      try {
+        payload = rawBody ? JSON.parse(rawBody) : null;
+      } catch {
+        payload = rawBody;
+      }
+    }
+
+    if (!response.ok) {
+      const detail =
+        payload?.error?.message ||
+        (typeof payload?.error === 'string' ? payload.error : '') ||
+        payload?.message ||
+        rawBody ||
+        '';
+      const info = classifyCloudError(response.status, detail, providerLabel);
+      throw makeVoiceError(info.code, info.message, info.action, info.retryable);
+    }
+
+    return payload;
+  }
+
+  async cleanupText(params = {}) {
+    const cfg = normalizeVoiceConfig({ ...this.config, ...(params.config || {}) });
+    const rawText = String(params.text ?? params.rawText ?? '').trim();
     if (!rawText) {
       return {
         rawText: '',
         cleanedText: '',
         text: '',
-        cleanupApplied: false,
+        usedLlm: false,
       };
     }
 
     const deterministic = cleanTranscriptText(rawText, {
-      cleanupMode: effectiveConfig.cleanupMode,
-      vocabulary: effectiveConfig.vocabulary,
+      cleanupMode: params.cleanupMode || cfg.cleanupMode,
+      vocabulary: params.vocabulary ?? cfg.vocabulary,
+      removeFillerWords: params.removeFillerWords ?? cfg.removeFillerWords,
+      correctionCue: params.correctionCue ?? cfg.correctionCue,
     });
 
-    if (effectiveConfig.cleanupMode === 'off') {
+    const cleanupMode = params.cleanupMode || cfg.cleanupMode;
+    const allowLlm =
+      cleanupMode !== 'off' &&
+      params.useLlm !== false &&
+      params.skipLlmCleanup !== true &&
+      cfg.useLlmCleanup !== false;
+
+    const apiKey = resolveApiKey(cfg, this.env);
+    const canCallLlm =
+      allowLlm &&
+      (Boolean(apiKey) || isLocalhostUrl(cfg.baseUrl)) &&
+      cfg.providerProtocol !== 'browser-speech' &&
+      (cfg.providerProtocol !== 'local-model' || params.forceLlm === true) &&
+      Boolean(cfg.cleanupModel) &&
+      (params.forceLlm === true ||
+        Boolean(params.draftContext) ||
+        Boolean(cfg.correctionCue) ||
+        Boolean(cfg.cleanupInstructions) ||
+        rawText.length >= 16);
+
+    if (!canCallLlm) {
       return {
         rawText,
         cleanedText: deterministic,
-        text: deterministic,
-        cleanupApplied: false,
-        method: 'off',
+        text: cleanupMode === 'off' ? rawText : deterministic,
+        usedLlm: false,
       };
     }
 
-    const apiKey = this.resolveEffectiveApiKey(effectiveConfig);
-    const useLlmCleanup =
-      Boolean(params.useLlm) &&
-      Boolean(apiKey) &&
-      typeof this.fetchImpl === 'function';
+    const reqId = params.requestId || `clean-${Date.now()}`;
+    const abortController = new AbortController();
+    this.activeAbortControllers.set(reqId, abortController);
+    const timeoutId = setTimeout(() => abortController.abort(), 18_000);
 
-    if (useLlmCleanup) {
-      try {
-        const req = buildCleanupChatRequest({
-          baseUrl: effectiveConfig.baseUrl,
-          apiKey,
-          model: effectiveConfig.cleanupModel || 'gpt-4o-mini',
-          rawText: deterministic,
-          language: effectiveConfig.language,
-          vocabulary: effectiveConfig.vocabulary,
-        });
-        const response = await this.fetchImpl(req.url, {
-          method: req.method,
-          headers: req.headers,
-          body: req.body,
-        });
-        if (response.ok) {
-          const data = await response.json();
-          const llmText = String(
-            data?.choices?.[0]?.message?.content ?? '',
-          ).trim();
-          if (llmText) {
-            const normalizedLlm = normalizeVocabularyTerms(
-              llmText,
-              effectiveConfig.vocabulary,
-            );
-            this.metrics.cleanedTranscriptions += 1;
-            return {
-              rawText,
-              cleanedText: normalizedLlm,
-              text: normalizedLlm,
-              cleanupApplied: normalizedLlm !== rawText,
-              method: 'llm',
-            };
-          }
-        }
-      } catch {
-        // Fall back to deterministic cleanup on network/LLM errors
+    try {
+      const cleanupBase =
+        cfg.providerProtocol === 'xai-stt' &&
+        cfg.baseUrl === DEFAULT_VOICE_CONFIG.baseUrl
+          ? 'https://api.x.ai/v1'
+          : cfg.providerProtocol === 'openrouter-stt' &&
+              cfg.baseUrl === DEFAULT_VOICE_CONFIG.baseUrl
+            ? 'https://openrouter.ai/api/v1'
+            : cfg.providerProtocol === 'groq-whisper' &&
+                cfg.baseUrl === DEFAULT_VOICE_CONFIG.baseUrl
+              ? 'https://api.groq.com/openai/v1'
+              : cfg.baseUrl;
+
+      const req = buildCleanupChatRequest({
+        baseUrl: cleanupBase,
+        apiKey,
+        model: params.cleanupModel || cfg.cleanupModel,
+        rawText: deterministic || rawText,
+        vocabulary: params.vocabulary ?? cfg.vocabulary,
+        language: params.language ?? cfg.language,
+        correctionCue: params.correctionCue ?? cfg.correctionCue,
+        cleanupInstructions: params.cleanupInstructions ?? cfg.cleanupInstructions,
+        removeFillerWords: params.removeFillerWords ?? cfg.removeFillerWords,
+        draftContext: params.draftContext || null,
+      });
+
+      const payload = await this._fetchJson(req, abortController.signal, 'LLM 润色');
+      const llmText = extractTranscriptionText(payload);
+      if (llmText) {
+        const finalClean = normalizeVocabularyTerms(
+          llmText,
+          params.vocabulary ?? cfg.vocabulary,
+        ).trim();
+        this.metrics.llmCleanups += 1;
+        return {
+          rawText,
+          cleanedText: finalClean,
+          text: finalClean,
+          usedLlm: true,
+        };
       }
+    } catch {
+      // Never lose user speech because LLM cleanup failed — gracefully fall back to deterministic cleanup
+    } finally {
+      clearTimeout(timeoutId);
+      this.activeAbortControllers.delete(reqId);
     }
 
-    this.metrics.cleanedTranscriptions += 1;
     return {
       rawText,
       cleanedText: deterministic,
       text: deterministic,
-      cleanupApplied: deterministic !== rawText,
-      method: 'deterministic',
+      usedLlm: false,
     };
   }
 
   async transcribe(params = {}) {
-    const startTime = Date.now();
-    this.metrics.totalTranscriptions += 1;
+    const startedAt = Date.now();
+    const cfg = normalizeVoiceConfig({ ...this.config, ...(params.config || {}) });
+    const protocol = params.providerProtocol || cfg.providerProtocol;
+    const language = params.language || cfg.language;
+    const translateToEnglish =
+      typeof params.translateToEnglish === 'boolean'
+        ? params.translateToEnglish
+        : cfg.translateToEnglish;
+    const liveTranscript = String(params.liveTranscript || '').trim();
+    const rawAudioBase64 = stripBase64DataUrlPrefix(
+      params.audioBase64 || params.wavBase64 || '',
+    );
+    const wavBase64 = stripBase64DataUrlPrefix(params.wavBase64 || '');
+    const mimeType = params.mimeType || (wavBase64 && !params.audioBase64 ? 'audio/wav' : 'audio/webm');
 
-    const effectiveConfig = {
-      ...this.config,
-      ...(params.config && typeof params.config === 'object' ? params.config : {}),
-    };
+    let effectiveAudioBase64 = rawAudioBase64;
+    let effectiveMimeType = mimeType;
+    let silenceMeta = null;
 
-    if (!effectiveConfig.enabled) {
-      return {
-        text: '',
-        rawText: '',
-        cleanedText: '',
-        skippedReason: 'disabled',
-      };
+    const isCloudProtocol =
+      protocol === 'openai-whisper' ||
+      protocol === 'groq-whisper' ||
+      protocol === 'xai-stt' ||
+      protocol === 'openrouter-stt' ||
+      protocol === 'openai-chat-audio' ||
+      protocol === 'custom-openai' ||
+      protocol === 'hybrid';
+
+    // Optional WAV silence filtering & no-speech detection before cloud or local inference
+    const wavCandidate = wavBase64 || (mimeType.includes('wav') ? rawAudioBase64 : '');
+    let effectiveWavBase64 = wavCandidate;
+    if (cfg.silenceFiltering && wavCandidate) {
+      const vad = filterSilenceFromWavBase64(wavCandidate);
+      if (vad.analyzed) {
+        silenceMeta = {
+          hasSpeech: vad.hasSpeech,
+          originalDurationMs: vad.originalDurationMs,
+          trimmedDurationMs: vad.trimmedDurationMs,
+          speechRatio: vad.speechRatio,
+        };
+        if (
+          !vad.hasSpeech &&
+          !liveTranscript &&
+          ((isCloudProtocol && protocol !== 'hybrid') || protocol === 'local-model')
+        ) {
+          this.metrics.silenceFilteredCount += 1;
+          this.metrics.lastError = '未检测到人声语音，请靠近麦克风重试';
+          this.metrics.lastErrorCode = 'no-speech';
+          throw makeVoiceError(
+            'no-speech',
+            '未检测到人声语音，请靠近麦克风重试',
+            'retry',
+            false,
+          );
+        }
+        if (vad.hasSpeech && vad.wavBase64) {
+          effectiveWavBase64 = vad.wavBase64;
+          if (mimeType.includes('wav') || !params.audioBase64 || protocol === 'local-model') {
+            effectiveAudioBase64 = vad.wavBase64;
+            effectiveMimeType = 'audio/wav';
+            this.metrics.silenceFilteredCount += 1;
+          }
+        }
+      }
     }
 
-    const requestId = String(
-      params.requestId || `voice-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    const reqId = params.requestId || `stt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const abortController = new AbortController();
+    this.activeAbortControllers.set(reqId, abortController);
+    const timeoutId = setTimeout(
+      () => abortController.abort(),
+      protocol === 'local-model' ? 95_000 : 45_000,
     );
-    const controller = new AbortController();
-    this.activeControllers.set(requestId, controller);
+
+    let rawText = '';
+    let resolvedProvider = protocol;
 
     try {
-      const protocol = effectiveConfig.providerProtocol || 'hybrid';
-      const apiKey = this.resolveEffectiveApiKey(effectiveConfig);
-      const audioBase64 = String(params.audioBase64 || '').trim();
-      const wavBase64 = String(
-        params.wavBase64 || (params.mimeType === 'audio/wav' ? audioBase64 : ''),
-      ).trim();
-      const mimeType = String(params.mimeType || 'audio/webm').trim();
-      const liveTranscript = String(
-        params.liveTranscript ?? params.rawText ?? params.text ?? '',
-      ).trim();
-
-      let rawTranscript = '';
-      let providerUsed = 'browser-speech';
-
-      const canCallCloudAudio =
-        Boolean(audioBase64) &&
-        protocol !== 'browser-speech' &&
-        (Boolean(apiKey) || Boolean(params.allowUnauthenticatedCloud)) &&
-        typeof this.fetchImpl === 'function';
-
-      if (canCallCloudAudio) {
-        if (protocol === 'openai-chat-audio') {
-          const chatReq = buildChatAudioRequest({
-            baseUrl: effectiveConfig.baseUrl,
-            apiKey,
-            model: effectiveConfig.model || 'gpt-4o-audio-preview',
-            audioBase64: wavBase64 || audioBase64,
-            mimeType: wavBase64 ? 'audio/wav' : mimeType,
-            language: effectiveConfig.language,
-            vocabulary: effectiveConfig.vocabulary,
-            cleanupMode: effectiveConfig.cleanupMode,
-          });
-          const res = await this.fetchImpl(chatReq.url, {
-            method: chatReq.method,
-            headers: chatReq.headers,
-            body: chatReq.body,
-            signal: controller.signal,
-          });
-          if (!res.ok) {
-            const errBody = await res.text().catch(() => '');
-            throw new Error(
-              `Chat Audio transcription failed (${res.status}): ${errBody || res.statusText}`,
-            );
-          }
-          const json = await res.json();
-          rawTranscript = String(
-            json?.choices?.[0]?.message?.content ?? json?.text ?? '',
-          ).trim();
-          providerUsed = 'openai-chat-audio';
-        } else {
-          const multipartReq = buildMultipartAudioRequest({
-            baseUrl: effectiveConfig.baseUrl,
-            apiKey,
-            providerProtocol:
-              protocol === 'groq-whisper' ? 'groq-whisper' : 'openai-whisper',
-            model: effectiveConfig.model,
-            audioBase64,
-            mimeType,
-            language: effectiveConfig.language,
-            vocabulary: effectiveConfig.vocabulary,
-          });
-          const res = await this.fetchImpl(multipartReq.url, {
-            method: multipartReq.method,
-            headers: multipartReq.headers,
-            body: multipartReq.body,
-            signal: controller.signal,
-          });
-          if (!res.ok) {
-            if (protocol === 'hybrid' && liveTranscript) {
-              rawTranscript = liveTranscript;
-              providerUsed = 'hybrid-live-fallback';
-            } else {
-              const errBody = await res.text().catch(() => '');
-              throw new Error(
-                `Whisper transcription failed (${res.status}): ${errBody || res.statusText}`,
-              );
-            }
-          } else {
-            const json = await res.json();
-            rawTranscript = String(json?.text ?? '').trim() || liveTranscript;
-            providerUsed =
-              protocol === 'groq-whisper' ? 'groq-whisper' : 'openai-whisper';
-          }
-        }
-      } else {
-        rawTranscript = liveTranscript;
-        providerUsed =
-          protocol === 'hybrid' ? 'hybrid-browser-speech' : 'browser-speech';
-
-        if (
-          !rawTranscript &&
-          wavBase64 &&
-          typeof this.nativeOsTranscribeImpl === 'function'
-        ) {
-          const osTranscript = await this.nativeOsTranscribeImpl(
-            wavBase64,
-            effectiveConfig.language,
-            controller.signal,
+      if (protocol === 'local-model') {
+        const targetModelId = params.localModelId || cfg.localModelId;
+        const model =
+          this.modelStore?.catalog?.find((m) => m.id === targetModelId) ||
+          getLocalSpeechModel(targetModelId);
+        if (!model) {
+          throw makeVoiceError(
+            'local-model-missing',
+            `未知的本地语音模型：${String(targetModelId)}，请在状态栏「本地模型」面板重新选择。`,
+            'models',
+            false,
           );
-          if (osTranscript) {
-            rawTranscript = osTranscript;
-            providerUsed =
-              protocol === 'hybrid' ? 'hybrid-os-speech' : 'os-speech';
+        }
+
+        const modelPath = await this.modelStore.getInstalledPath(model);
+        if (!modelPath) {
+          throw makeVoiceError(
+            'local-model-missing',
+            `尚未安装本地模型「${model.name}」，请在状态栏「本地模型」面板一键下载或导入本地文件。`,
+            'models',
+            false,
+          );
+        }
+
+        const engineStatus = await this.localRuntime.getEngineStatus();
+        if (!engineStatus.installed) {
+          throw makeVoiceError(
+            'local-engine-missing',
+            '尚未安装本地语音推理引擎（transcribe.cpp），请在状态栏「本地模型」面板点击「安装推理引擎」。',
+            'models',
+            false,
+          );
+        }
+
+        if (!effectiveWavBase64) {
+          throw makeVoiceError(
+            'no-speech',
+            '本地模型需要 16kHz PCM WAV 音频输入，未捕获到有效录音数据。',
+            'retry',
+            true,
+          );
+        }
+
+        const parsedWav = parseWavBuffer(Buffer.from(effectiveWavBase64, 'base64'));
+        if (!parsedWav || !parsedWav.samples || parsedWav.samples.length === 0) {
+          throw makeVoiceError(
+            'no-speech',
+            '无法解析录音 WAV 数据，请重试。',
+            'retry',
+            true,
+          );
+        }
+
+        const localRes = await this.localRuntime.transcribePcm({
+          modelPath,
+          modelId: model.id,
+          pcmFloat32: parsedWav.samples,
+          sampleRate: parsedWav.sampleRate,
+          language,
+          translateToEnglish: Boolean(translateToEnglish && model.supportsTranslation),
+          vocabulary: cfg.vocabulary,
+          acceleration: cfg.localAcceleration,
+          unloadTimeoutSec: cfg.localUnloadTimeoutSec,
+          signal: abortController.signal,
+        });
+
+        rawText = String(localRes?.text || '').trim();
+        const shortName = model.filename.replace(/\.gguf$/i, '');
+        resolvedProvider = `local-model:${shortName}${localRes?.backend ? ` (${localRes.backend})` : ''}`;
+        this.metrics.localModelTranscriptions += 1;
+      } else {
+        const apiKey = resolveApiKey(cfg, this.env);
+        const canUseCloud =
+          isCloudProtocol &&
+          Boolean(effectiveAudioBase64) &&
+          !(silenceMeta && silenceMeta.hasSpeech === false) &&
+          (Boolean(apiKey) ||
+            ((protocol === 'custom-openai' || protocol === 'openai-whisper') &&
+              isLocalhostUrl(cfg.baseUrl)));
+
+        if (canUseCloud) {
+          let req;
+          if (protocol === 'xai-stt') {
+            req = buildXaiSttRequest({
+              baseUrl: cfg.baseUrl,
+              apiKey,
+              model: cfg.model,
+              audioBase64: effectiveAudioBase64,
+              mimeType: effectiveMimeType,
+              language,
+              vocabulary: cfg.vocabulary,
+              correctionCue: cfg.correctionCue,
+              removeFillerWords: cfg.removeFillerWords,
+            });
+          } else if (protocol === 'openrouter-stt') {
+            req = buildOpenRouterAudioRequest({
+              baseUrl: cfg.baseUrl,
+              apiKey,
+              model: cfg.model,
+              audioBase64: effectiveAudioBase64,
+              mimeType: effectiveMimeType,
+              language,
+              vocabulary: cfg.vocabulary,
+              correctionCue: cfg.correctionCue,
+            });
+          } else if (protocol === 'openai-chat-audio') {
+            req = buildChatAudioRequest({
+              baseUrl: cfg.baseUrl,
+              apiKey,
+              model: cfg.model,
+              audioBase64: effectiveAudioBase64,
+              mimeType: effectiveMimeType,
+              language,
+              translateToEnglish,
+              vocabulary: cfg.vocabulary,
+              correctionCue: cfg.correctionCue,
+            });
+          } else {
+            req = buildMultipartAudioRequest({
+              baseUrl: cfg.baseUrl,
+              apiKey,
+              providerProtocol: protocol === 'hybrid' ? 'openai-whisper' : protocol,
+              model: cfg.model,
+              audioBase64: effectiveAudioBase64,
+              mimeType: effectiveMimeType,
+              language,
+              translateToEnglish,
+              vocabulary: cfg.vocabulary,
+              correctionCue: cfg.correctionCue,
+            });
+          }
+
+          try {
+            const payload = await this._fetchJson(req, abortController.signal, protocol);
+            rawText = extractTranscriptionText(payload);
+            resolvedProvider = protocol === 'hybrid' ? 'hybrid-cloud-whisper' : protocol;
+            this.metrics.cloudTranscriptions += 1;
+          } catch (cloudErr) {
+            if (protocol === 'hybrid' && liveTranscript) {
+              rawText = liveTranscript;
+              resolvedProvider = 'hybrid-browser-speech';
+              this.metrics.browserFallbackTranscriptions += 1;
+            } else {
+              throw cloudErr;
+            }
+          }
+        } else if (
+          isCloudProtocol &&
+          protocol !== 'hybrid' &&
+          !liveTranscript &&
+          !apiKey
+        ) {
+          throw makeVoiceError(
+            'missing-key',
+            `尚未配置 ${protocol} 所需的 API 密钥，请在设置中填写或切换到本地模型 / 浏览器原生识别。`,
+            'settings',
+            false,
+          );
+        } else if (liveTranscript) {
+          rawText = liveTranscript;
+          resolvedProvider =
+            protocol === 'hybrid' ? 'hybrid-browser-speech' : 'browser-speech';
+          this.metrics.browserFallbackTranscriptions += 1;
+        } else if (
+          (protocol === 'browser-speech' || protocol === 'hybrid') &&
+          (wavBase64 || effectiveAudioBase64)
+        ) {
+          const osText = await this.nativeOsTranscribeImpl(
+            wavBase64 || effectiveAudioBase64,
+            language,
+          );
+          if (osText && osText.trim()) {
+            rawText = osText.trim();
+            resolvedProvider = 'os-speech';
+            this.metrics.osSpeechTranscriptions += 1;
           }
         }
       }
 
-      const cleanupResult = await this.cleanup({
-        rawText: rawTranscript,
-        config: effectiveConfig,
-        useLlm: Boolean(params.useLlmCleanup),
+      if (!rawText) {
+        throw makeVoiceError(
+          'no-speech',
+          '未识别到有效语音内容，请检查麦克风或重试。',
+          'retry',
+          false,
+        );
+      }
+
+      // Deterministic cleanup immediately; optional LLM cleanup unless deferred to client two-stage flow
+      const deterministicCleaned = cleanTranscriptText(rawText, {
+        cleanupMode: cfg.cleanupMode,
+        vocabulary: cfg.vocabulary,
+        removeFillerWords: cfg.removeFillerWords,
+        correctionCue: cfg.correctionCue,
       });
 
-      const finalText =
-        effectiveConfig.cleanupMode === 'off'
-          ? cleanupResult.rawText
-          : cleanupResult.cleanedText;
+      let cleanedText = deterministicCleaned;
+      let usedLlm = false;
+      const shouldRunInlineLlm =
+        params.deferLlmCleanup !== true &&
+        params.skipLlmCleanup !== true &&
+        protocol !== 'local-model' &&
+        cfg.cleanupMode !== 'off' &&
+        cfg.useLlmCleanup === true &&
+        Boolean(params.draftContext || cfg.correctionCue || cfg.cleanupInstructions);
 
-      const latencyMs = Math.max(1, Date.now() - startTime);
-      this.metrics.completedTranscriptions += 1;
-      this.metrics.lastLatencyMs = latencyMs;
-      this.metrics.lastProviderUsed = providerUsed;
-      this.metrics.lastError = null;
+      if (shouldRunInlineLlm) {
+        const llmRes = await this.cleanupText({
+          text: rawText,
+          config: cfg,
+          draftContext: params.draftContext || null,
+          requestId: `${reqId}-clean`,
+        });
+        cleanedText = llmRes.cleanedText || deterministicCleaned;
+        usedLlm = Boolean(llmRes.usedLlm);
+      }
+
+      const finalText = cfg.cleanupMode === 'off' ? deterministicCleaned : cleanedText;
+      const latencyMs = Date.now() - startedAt;
 
       const entry = {
-        id: requestId,
-        timestamp: Date.now(),
-        rawText: rawTranscript,
-        cleanedText: cleanupResult.cleanedText,
+        id: `voice-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        timestamp: new Date().toISOString(),
+        provider: resolvedProvider,
+        language,
+        rawText,
+        cleanedText,
         text: finalText,
-        provider: providerUsed,
-        language: effectiveConfig.language,
-        cleanupMode: effectiveConfig.cleanupMode,
+        usedLlm,
         latencyMs,
+        silenceMeta,
       };
-      if (finalText) {
-        this.history.unshift(entry);
-        if (this.history.length > 25) {
-          this.history.length = 25;
-        }
-      }
 
-      return {
-        ...entry,
-        cleanupApplied: cleanupResult.cleanupApplied,
-      };
-    } catch (error) {
-      const isAbort =
-        controller.signal.aborted ||
-        error?.name === 'AbortError' ||
-        /aborted|cancelled/i.test(String(error?.message || ''));
-      if (isAbort) {
-        return {
-          requestId,
-          text: '',
-          rawText: '',
-          cleanedText: '',
-          cancelled: true,
-        };
-      }
-      this.metrics.errors += 1;
-      this.metrics.lastError = String(error?.message || error);
-      throw error;
+      this.history.unshift(entry);
+      if (this.history.length > 30) this.history.length = 30;
+      this.metrics.totalTranscriptions += 1;
+      this.metrics.lastLatencyMs = latencyMs;
+      this.metrics.lastProvider = resolvedProvider;
+      this.metrics.lastError = null;
+      this.metrics.lastErrorCode = null;
+
+      return entry;
+    } catch (err) {
+      this.metrics.lastError = String(err?.message || err);
+      this.metrics.lastErrorCode = err?.code || err?.errorCode || 'transcription-failed';
+      throw err;
     } finally {
-      this.activeControllers.delete(requestId);
+      clearTimeout(timeoutId);
+      this.activeAbortControllers.delete(reqId);
     }
+  }
+
+  async getLocalModelsState(options = {}) {
+    const [models, engine] = await Promise.all([
+      this.modelStore.listModels(this.config.localModelId),
+      this.localRuntime.getEngineStatus(),
+    ]);
+    if (options.probeBackends && engine.transcribeCppInstalled && (!engine.backends || engine.backends.length === 0)) {
+      engine.backends = await this.localRuntime.discoverBackends();
+    }
+    return {
+      models,
+      activeModelId: this.config.localModelId,
+      providerProtocol: this.config.providerProtocol,
+      modelsDir: this.modelStore.modelsDir,
+      runtimeDir: this.localRuntime.runtimeDir,
+      hfMirrorUrl: this.config.hfMirrorUrl,
+      localAcceleration: this.config.localAcceleration,
+      localUnloadTimeoutSec: this.config.localUnloadTimeoutSec,
+      engine,
+    };
+  }
+
+  async downloadLocalModel(input = {}) {
+    const modelId = input.modelId || this.config.localModelId;
+    const hfMirrorUrl = input.hfMirrorUrl || this.config.hfMirrorUrl;
+    const download = this.modelStore.startDownload(modelId, { hfMirrorUrl });
+
+    if (input.autoInstallEngine) {
+      const status = await this.localRuntime.getEngineStatus();
+      if (!status.installed && status.installState?.status !== 'installing') {
+        void this.localRuntime.installEngine().catch(() => {});
+      }
+    }
+
+    if (input.waitForCompletion) {
+      const record = this.modelStore.activeDownloads.get(modelId);
+      if (record?.promise) {
+        await record.promise;
+      }
+    }
+
+    return {
+      started: true,
+      modelId,
+      download,
+      state: await this.getLocalModelsState(),
+    };
+  }
+
+  async cancelLocalModelDownload(input = {}) {
+    const res = this.modelStore.cancelDownload(input.modelId);
+    return {
+      ...res,
+      state: await this.getLocalModelsState(),
+    };
+  }
+
+  async removeLocalModel(input = {}) {
+    const modelId = input.modelId;
+    if (this.localRuntime?._loadedModelId === modelId) {
+      await this.localRuntime.unload();
+    }
+    const res = await this.modelStore.remove(modelId);
+    return {
+      ...res,
+      state: await this.getLocalModelsState(),
+    };
+  }
+
+  async linkLocalModels(input = {}) {
+    const result = await this.modelStore.linkFromSource(input.sourcePath);
+    return {
+      ...result,
+      state: await this.getLocalModelsState(),
+    };
+  }
+
+  async installLocalEngine(input = {}) {
+    if (input.background) {
+      void this.localRuntime.installEngine({ force: Boolean(input.force) }).catch(() => {});
+      return {
+        started: true,
+        state: await this.getLocalModelsState(),
+      };
+    }
+    const engine = await this.localRuntime.installEngine({ force: Boolean(input.force) });
+    return {
+      installed: Boolean(engine.installed),
+      engine,
+      state: await this.getLocalModelsState(),
+    };
+  }
+
+  async unloadLocalModel() {
+    const res = await this.localRuntime.unload();
+    return {
+      ...res,
+      state: await this.getLocalModelsState(),
+    };
+  }
+
+  dispose() {
+    this.cancel();
+    this.modelStore?.dispose?.();
+    this.localRuntime?.dispose?.();
   }
 }
 
 export function createVoiceInputWorkerDefinition(options = {}) {
   const engine = new VoiceInputEngine(options);
 
-  const workerDefinition = definePluginWorker((registrar, environment) => {
-    const initialConfig =
-      environment?.config?.get?.() ||
-      environment?.context?.config ||
-      {};
-    if (initialConfig && typeof initialConfig === 'object') {
-      engine.updateConfig(initialConfig);
-    }
-
-    if (typeof registrar.onConfigUpdate === 'function') {
-      registrar.onConfigUpdate((nextConfig) => {
-        if (nextConfig && typeof nextConfig === 'object') {
-          engine.updateConfig(nextConfig);
-        }
-      });
-    }
-
-    registrar.handle('voice.status', async () => {
-      return engine.getStatus();
-    });
-
-    registrar.handle('voice.configure', async (params) => {
-      if (params && typeof params === 'object') {
-        engine.updateConfig(params);
+  const workerDefinition = {
+    async setup(registrar, setupContext = {}) {
+      const initialConfig = setupContext?.context?.config;
+      if (initialConfig && typeof initialConfig === 'object') {
+        engine.updateConfig(initialConfig);
       }
-      return engine.getStatus();
-    });
 
-    registrar.handle('voice.toggle', async (params) => {
-      const nextEnabled =
-        params && typeof params === 'object' && typeof params.enabled === 'boolean'
-          ? params.enabled
-          : !engine.getConfig().enabled;
-      engine.updateConfig({ enabled: nextEnabled });
-      return engine.getStatus();
-    });
+      if (typeof registrar.onConfigUpdate === 'function') {
+        registrar.onConfigUpdate((nextConfig) => {
+          engine.updateConfig(nextConfig);
+        });
+      }
 
-    registrar.handle('voice.transcribe', async (params) => {
-      return await engine.transcribe(
-        params && typeof params === 'object' ? params : {},
-      );
-    });
-
-    registrar.handle('voice.cleanup', async (params) => {
-      return await engine.cleanup(
-        params && typeof params === 'object' ? params : {},
-      );
-    });
-
-    registrar.handle('voice.cancel', async (params) => {
-      const requestId =
-        params && typeof params === 'object' && typeof params.requestId === 'string'
-          ? params.requestId
-          : null;
-      return engine.cancelRequest(requestId);
-    });
-
-    if (typeof registrar.onDispose === 'function') {
-      registrar.onDispose(() => {
-        engine.cancelRequest();
+      registrar.handle('voice.status', async () => engine.getStatus());
+      registrar.handle('voice.configure', async (input) => {
+        if (input && typeof input === 'object') {
+          engine.updateConfig(input);
+        }
+        return engine.getStatus();
       });
-    }
-  });
+      registrar.handle('voice.toggle', async (input) => {
+        if (input && typeof input.enabled === 'boolean') {
+          engine.updateConfig({ enabled: input.enabled });
+        }
+        return engine.getStatus();
+      });
+      registrar.handle('voice.transcribe', async (input) => {
+        return await engine.transcribe(input || {});
+      });
+      registrar.handle('voice.cleanup', async (input) => {
+        return await engine.cleanupText(input || {});
+      });
+      registrar.handle('voice.cancel', async (input) => {
+        return engine.cancel(input?.requestId);
+      });
+      registrar.handle('voice.history', async (input) => {
+        return { items: engine.getHistory(input?.limit || 20) };
+      });
 
-  return {
-    engine,
-    workerDefinition,
+      // Local offline speech model & engine management handlers
+      registrar.handle('voice.local.models', async (input) => {
+        return await engine.getLocalModelsState(input || {});
+      });
+      registrar.handle('voice.local.download', async (input) => {
+        return await engine.downloadLocalModel(input || {});
+      });
+      registrar.handle('voice.local.cancelDownload', async (input) => {
+        return await engine.cancelLocalModelDownload(input || {});
+      });
+      registrar.handle('voice.local.remove', async (input) => {
+        return await engine.removeLocalModel(input || {});
+      });
+      registrar.handle('voice.local.link', async (input) => {
+        return await engine.linkLocalModels(input || {});
+      });
+      registrar.handle('voice.local.installEngine', async (input) => {
+        return await engine.installLocalEngine(input || {});
+      });
+      registrar.handle('voice.local.unload', async () => {
+        return await engine.unloadLocalModel();
+      });
+
+      if (typeof registrar.onDispose === 'function') {
+        registrar.onDispose(() => {
+          engine.dispose();
+        });
+      }
+    },
   };
+
+  return { engine, workerDefinition };
 }
 
 const defaultWorker = createVoiceInputWorkerDefinition();
 export const engine = defaultWorker.engine;
 export default defaultWorker.workerDefinition;
 
-// Standalone stdio protocol 1.1 loop when executed as a child worker process by the VibeX Host
-async function runStdioLoopIfMain(definition) {
-  if (typeof process === 'undefined' || !process.argv?.[1]) return;
-  let isMain = false;
-  try {
-    isMain = import.meta.url === pathToFileURL(process.argv[1]).href;
-  } catch {
-    isMain = false;
-  }
-  if (!isMain) return;
-
+export async function startVoiceInputStdioLoop(definition = defaultWorker.workerDefinition) {
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
   const handlers = new Map();
   const disposables = [];
@@ -1086,8 +973,10 @@ async function runStdioLoopIfMain(definition) {
                 id: message.id,
                 ok: false,
                 error: {
-                  code: 'worker_failed',
+                  code: err?.code || err?.errorCode || 'worker_failed',
                   message: String(err?.message || err),
+                  action: err?.action || err?.errorAction || null,
+                  retryable: Boolean(err?.retryable),
                 },
               }),
             );
@@ -1122,7 +1011,7 @@ async function runStdioLoopIfMain(definition) {
         id: message.id,
         ok: false,
         error: {
-          code: 'worker_failed',
+          code: err?.code || 'worker_failed',
           message: String(err?.message || err),
         },
       });
@@ -1130,4 +1019,17 @@ async function runStdioLoopIfMain(definition) {
   }
 }
 
-void runStdioLoopIfMain(defaultWorker.workerDefinition);
+function runStdioLoopIfMain() {
+  if (typeof process === 'undefined' || !process.argv?.[1]) return;
+  let isMain = false;
+  try {
+    isMain = import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+  } catch {
+    isMain = false;
+  }
+  if (isMain) {
+    void startVoiceInputStdioLoop(defaultWorker.workerDefinition);
+  }
+}
+
+runStdioLoopIfMain();
